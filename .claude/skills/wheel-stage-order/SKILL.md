@@ -39,6 +39,26 @@ uv run python .claude/skills/wheel-stage-order/scripts/stage_order.py SYMBOL \
 
 Exit codes: `0` staged clean, `1` blocked by a guardrail, `2` contract would not qualify.
 
+## Paper first
+
+`--execute` transmits only to a **paper** account (IB ids start with `DU`) until
+`profile.toml` has `live_trading = true`, which only `wheel-onboard` sets. It also refuses
+to run at all without a `profile.toml`. In TWS, "Read-Only API" must be unticked for
+`--execute` to transmit; dry runs work either way.
+
+## Take profit: stage the 50% close right after a fill
+
+```bash
+uv run python .claude/skills/wheel-stage-order/scripts/stage_order.py SYMBOL \
+    --right P --strike N --expiry YYYYMMDD --limit HALF_THE_CREDIT --close
+```
+
+Stages a **GTC buy-to-close** limit that rests until filled. `--limit` is the price per
+share to pay back: half the credit received (sold at 0.90 → `--limit 0.45`). Blocked if the
+leg isn't held short (the BUY would open a new long option instead) or if the limit is
+above the ask. Cancel this resting order in TWS before rolling the same position. When it
+fills, log a `close`.
+
 ## Rolling an existing short
 
 ```bash

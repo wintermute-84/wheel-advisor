@@ -42,6 +42,25 @@ def validate(p: dict) -> dict:
     for k in ("excluded", "overweight"):
         if not (isinstance(u[k], list) and all(isinstance(s, str) for s in u[k])):
             errors.append(f'universe.{k} must be a list of tickers like ["QYLD"], got {u[k]!r}')
+    if z["max_position_collateral_frac"] > z["max_total_collateral_frac"]:
+        errors.append("sizing.max_position_collateral_frac cannot exceed max_total_collateral_frac")
+    a = p["account"]
+    if type(a["live_trading"]) is not bool:
+        errors.append(f"account.live_trading must be true or false, got {a['live_trading']!r}")
+    if a["experience"] not in ("beginner", "intermediate", "advanced"):
+        errors.append(
+            f"account.experience must be beginner|intermediate|advanced, got {a['experience']!r}"
+        )
+    cs = z["cash_secured_frac"]
+    if not (_num(cs) and 0.25 <= cs <= 1):
+        errors.append(f"sizing.cash_secured_frac must be in [0.25, 1], got {cs!r}")
+    elif cs < 1 and a["experience"] == "beginner":
+        errors.append(
+            "sizing.cash_secured_frac below 1.0 (margin-secured puts) is not allowed "
+            "for a beginner; keep 1.0"
+        )
+    if not (type(a["profitable_cycles"]) is int and a["profitable_cycles"] >= 0):
+        errors.append("account.profitable_cycles must be an integer >= 0")
     if errors:
         raise ValueError("invalid profile:\n  " + "\n  ".join(errors))
     return p
@@ -63,6 +82,10 @@ if __name__ == "__main__":
         {**ex, "sizing": {**ex["sizing"], "contracts_per_position": 0}},
         {**ex, "wheel": {**ex["wheel"], "min_credit": True}},
         {**ex, "wheel": {**ex["wheel"], "min_open_interest": 0}},
+        {**ex, "account": {**ex["account"], "live_trading": "yes"}},
+        {**ex, "sizing": {**ex["sizing"], "max_position_collateral_frac": 0.9}},
+        {**ex, "sizing": {**ex["sizing"], "cash_secured_frac": 0.5}},  # beginner on margin
+        {**ex, "sizing": {**ex["sizing"], "cash_secured_frac": 1.5}},
     ):
         try:
             validate(bad)

@@ -134,3 +134,16 @@ def get_multiple_earnings(symbols: list[str]) -> dict:
     results.sort(key=lambda x: x.get("earnings_date") or "9999-99-99")
 
     return {"results": results}
+
+
+def is_fund(symbol: str) -> bool:
+    """True for ETFs and other funds, which report no earnings.
+
+    Used to fail closed: a stock whose earnings date cannot be loaded is rejected, a fund
+    is not. If the lookup itself fails, report False so the caller rejects rather than
+    trades blind.
+    """
+    try:
+        return yf.Ticker(symbol).info.get("quoteType") in ("ETF", "MUTUALFUND")
+    except Exception:
+        return False

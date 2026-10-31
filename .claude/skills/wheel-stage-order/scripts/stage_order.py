@@ -46,7 +46,8 @@ def apply_profile(profile: dict) -> None:
     """
     global MIN_CREDIT_PER_CONTRACT, MAX_TOTAL_COLLATERAL_FRAC, MAX_CASH_COLLATERAL_FRAC
     global MIN_OPEN_INTEREST, MAX_SPREAD_FRAC, DELTA_BAND, DTE_BAND, MIN_UNDERLYING_PRICE
-    global MAX_CONTRACTS, EXCLUDED, OVERWEIGHT
+    global MAX_CONTRACTS, EXCLUDED, OVERWEIGHT, MAX_POSITION_COLLATERAL_FRAC, MAX_POSITIONS
+    global LIVE_TRADING, CASH_SECURED_FRAC
     w, z, u = profile["wheel"], profile["sizing"], profile["universe"]
     MIN_CREDIT_PER_CONTRACT = w["min_credit"]
     MIN_OPEN_INTEREST = w["min_open_interest"]
@@ -56,6 +57,10 @@ def apply_profile(profile: dict) -> None:
     MIN_UNDERLYING_PRICE = w["min_underlying_price"]
     MAX_TOTAL_COLLATERAL_FRAC = z["max_total_collateral_frac"]
     MAX_CASH_COLLATERAL_FRAC = z["max_cash_collateral_frac"]
+    MAX_POSITION_COLLATERAL_FRAC = z["max_position_collateral_frac"]
+    MAX_POSITIONS = z["max_positions"]
+    LIVE_TRADING = profile["account"]["live_trading"]
+    CASH_SECURED_FRAC = z["cash_secured_frac"]
     MAX_CONTRACTS = z["contracts_per_position"]
     EXCLUDED = {s.upper() for s in u["excluded"]}
     OVERWEIGHT = {s.upper() for s in u["overweight"]}
@@ -85,8 +90,16 @@ def check_guardrails(
     hv30: float | None = None,
     iv_rank: float | None = None,
     is_roll: bool = False,
+    open_put_collateral: float = 0.0,
+    open_puts: int = 0,
+    itm_puts: int = 0,
 ) -> tuple[list[str], list[str]]:
     """Return (blockers, warnings). Pure — no IB, no IO. This is the tested core.
+
+    open_put_collateral / open_puts / itm_puts describe the short puts ALREADY open, so
+    the book-level caps (total collateral, position count, no new put while one is in the
+    money) are enforced here, not left to a human. A roll replaces a position rather than
+    adding one, so it skips the book-level checks; check_roll() governs it.
 
     Blockers are the money-losing mistakes: too little credit for the commissions,
     too much capital at risk, an unfillable spread, or a covered call written
@@ -120,22 +133,49 @@ def check_guardrails(
         if excess_liquidity is None or settled_cash is None:
             blockers.append("could not read ExcessLiquidity/TotalCash; cannot size the position")
         else:
-            el_cap = excess_liquidity * MAX_TOTAL_COLLATERAL_FRAC
-            cash_cap = settled_cash * MAX_CASH_COLLATERAL_FRAC
+            # Cash already promised to open puts is not free: IB leaves it in the cash
+            # balance, but assignment on those puts would spend it.
+            # cash_secured_frac < 1 (margin-secured, never for beginners) reserves only part
+            # of each obligation in cash; the size caps below still use the full amount.
+            free_cash = settled_cash - (0.0 if is_roll else open_put_collateral * CASH_SECURED_FRAC)
+            el_cap = excess_liquidity * MAX_POSITION_COLLATERAL_FRAC
+            cash_cap = free_cash * MAX_CASH_COLLATERAL_FRAC / CASH_SECURED_FRAC
             cap = min(el_cap, cash_cap)
             which = "settled cash" if cash_cap <= el_cap else "excess liquidity"
             if collateral > cap:
                 blockers.append(
                     f"collateral ${collateral:,.0f} > ${cap:,.0f} cap — binding limit is "
-                    f"{which} ({MAX_CASH_COLLATERAL_FRAC:.0%} of ${settled_cash:,.0f} = "
-                    f"${cash_cap:,.0f}; {MAX_TOTAL_COLLATERAL_FRAC:.0%} of excess liquidity = "
+                    f"{which} ({MAX_CASH_COLLATERAL_FRAC:.0%} of ${free_cash:,.0f} free cash = "
+                    f"${cash_cap:,.0f}; {MAX_POSITION_COLLATERAL_FRAC:.0%} of excess liquidity = "
                     f"${el_cap:,.0f})"
                 )
-            if collateral > settled_cash:
+            if collateral * CASH_SECURED_FRAC > free_cash:
                 blockers.append(
-                    f"collateral ${collateral:,.0f} exceeds settled cash ${settled_cash:,.0f} — "
-                    f"this would NOT be cash-secured; assignment would require borrowing"
+                    f"cash needed ${collateral * CASH_SECURED_FRAC:,.0f} exceeds free settled cash "
+                    f"${free_cash:,.0f} — this would NOT be cash-secured; assignment would "
+                    f"require borrowing beyond your profile"
                 )
+            elif CASH_SECURED_FRAC < 1:
+                warnings.append(
+                    f"margin-secured: only {CASH_SECURED_FRAC:.0%} of the ${collateral:,.0f} "
+                    f"obligation is in cash; assignment borrows the rest on margin"
+                )
+            if not is_roll:
+                total_cap = excess_liquidity * MAX_TOTAL_COLLATERAL_FRAC
+                if open_put_collateral + collateral > total_cap:
+                    blockers.append(
+                        f"total put collateral ${open_put_collateral + collateral:,.0f} "
+                        f"(${open_put_collateral:,.0f} open + ${collateral:,.0f} new) > "
+                        f"${total_cap:,.0f} ({MAX_TOTAL_COLLATERAL_FRAC:.0%} of excess liquidity)"
+                    )
+                if open_puts >= MAX_POSITIONS:
+                    blockers.append(
+                        f"{open_puts} short put(s) already open; profile allows {MAX_POSITIONS}"
+                    )
+                if itm_puts:
+                    blockers.append(
+                        f"{itm_puts} open put(s) in the money — manage those before adding risk"
+                    )
     elif right == "C":
         needed = 100 * qty
         if shares_held is None:
@@ -160,7 +200,11 @@ def check_guardrails(
                 f"limit {limit:.2f} is below the bid {bid:.2f} — leaving money on the table"
             )
     else:
-        blockers.append("no live bid/ask — check the OPRA subscription before pricing a limit")
+        blockers.append(
+            "no live bid/ask. Either OPRA is not subscribed, the paper account is not sharing "
+            "the live subscription, or the quote has not arrived yet. Do not set a limit from "
+            "a delayed quote"
+        )
 
     # Tier 3 liquidity: you must be able to CLOSE the position, not just open it.
     if open_interest is None:
@@ -352,6 +396,32 @@ def roll_block(
     return "\n".join(lines)
 
 
+def premium_label(iv: float | None, hv30: float | None, iv_rank: float | None) -> str:
+    """thin / normal / rich. Thin means wait: premium is cheap versus history or movement."""
+    if iv_rank is None or (iv is not None and hv30 and iv < hv30) or iv_rank < 30:
+        return "thin"
+    return "normal" if iv_rank < 50 else "rich"
+
+
+def plain_summary(
+    *, symbol: str, right: str, strike: float, expiry: str, limit: float, qty: int
+) -> list[str]:
+    """Three sentences a beginner can act on, printed above the numbers."""
+    sym, n, credit = symbol.upper(), qty * 100, limit * 100 * qty
+    when = f"{expiry[:4]}-{expiry[4:6]}-{expiry[6:]}"
+    if right == "P":
+        return [
+            f"  In plain words: if {sym} closes below ${strike:g} on {when}, you buy {n} shares",
+            f"  for ${strike * n:,.0f}. That cash stays locked until then. The most you can lose",
+            f"  is those shares going to zero, minus the ${credit:,.0f} you collect now.",
+        ]
+    return [
+        f"  In plain words: if {sym} closes above ${strike:g} on {when}, your {n} shares are",
+        f"  sold at ${strike:g}. You keep the ${credit:,.0f} either way, but give up any gain",
+        "  above the strike.",
+    ]
+
+
 def risk_block(
     *,
     symbol: str,
@@ -402,6 +472,10 @@ def risk_block(
         "=" * 68,
         f"  SELL {qty} {symbol.upper()} {expiry} {strike:g}{right} @ LMT {limit:.2f}",
         "",
+        *plain_summary(
+            symbol=symbol, right=right, strike=strike, expiry=expiry, limit=limit, qty=qty
+        ),
+        "",
         f"  underlying        ${underlying_price:,.2f}"
         if underlying_price
         else "  underlying        n/a",
@@ -412,6 +486,7 @@ def risk_block(
             f"  implied vol       {iv:.1f}%"
             + (f"   vs 30d realised {hv30:.1f}%  (IV/HV {iv / hv30:.2f})" if hv30 else "")
             + (f"   IV rank {iv_rank:.0f}" if iv_rank is not None else "")
+            + f"   premium: {premium_label(iv, hv30, iv_rank).upper()}"
             if iv is not None
             else "  implied vol       n/a"
         ),
@@ -521,26 +596,62 @@ async def stage(args) -> int:
             account = accounts[0] if accounts else None
         excess = await fetch_excess_liquidity(ib, account) if account else None
 
+        # Paper first: --execute only transmits to a paper account (IB ids start with DU)
+        # until the user has deliberately set live_trading = true in profile.toml.
+        if args.execute and not LIVE_TRADING and not (account or "").startswith("DU"):
+            print(
+                f"\n  BLOCKED: account {account or '?'} is not a paper account and "
+                f"profile.toml has live_trading = false. Trade on paper first; switch to live "
+                f"only through the wheel-onboard skill.\n"
+            )
+            return 1
+
+        if args.close:
+            return await _stage_close(ib, args, contract, account, bid, ask, generated_at_str)
+
+        # Settled cash is the cash-secured test. TotalCashValue includes unsettled
+        # proceeds, so use it only as a labelled fallback.
         settled_cash = None
+        cash_warning = None
         if account:
             try:
                 summary = await ib.accountSummaryAsync(account)
-                rows = [i for i in summary if i.tag == "TotalCashValue"]
-                exact = [i for i in rows if i.account == account]
-                if rows:
-                    settled_cash = float((exact or rows)[0].value)
+                for tag in ("SettledCash", "TotalCashValue"):
+                    rows = [i for i in summary if i.tag == tag]
+                    exact = [i for i in rows if i.account == account]
+                    if rows:
+                        settled_cash = float((exact or rows)[0].value)
+                        if tag != "SettledCash":
+                            cash_warning = "SettledCash unavailable; sized on TotalCashValue"
+                        break
             except Exception:
                 settled_cash = None
 
+        positions = normalize_positions(await fetch_positions(ib, account))
         shares_held = None
         if args.right == "C":
-            positions = normalize_positions(await fetch_positions(ib, account))
             shares_held = sum(
-                p["position"]
+                p["quantity"]
                 for p in positions
                 if p.get("symbol", "").upper() == args.symbol.upper()
                 and p.get("sec_type") in ("STK", None)
             )
+        short_puts = [
+            p
+            for p in positions
+            if p.get("sec_type") == "OPT" and p.get("right") == "P" and p["quantity"] < 0
+        ]
+        open_put_collateral = sum(p["strike"] * 100 * -p["quantity"] for p in short_puts)
+        itm_puts = 0
+        for p in short_puts:
+            # ponytail: yfinance spot per open put; delayed, but ITM is a coarse test.
+            try:
+                import yfinance as yf
+
+                spot = yf.Ticker(p["symbol"]).fast_info.get("lastPrice")
+                itm_puts += bool(spot and spot < p["strike"])
+            except Exception:
+                pass
 
         dte = days_to_expiry(args.expiry)
 
@@ -597,19 +708,23 @@ async def stage(args) -> int:
         except Exception:
             iv_rank = None
 
-        # Earnings inside the window is a hard reject. ETFs return None and pass.
+        # Earnings inside the window is a hard reject. Funds have no earnings and pass;
+        # a stock whose date cannot be loaded fails closed.
         days_to_earnings = None
+        earnings_unknown = False
         try:
             from datetime import date
             from datetime import datetime as _dt
 
-            from trading_skills.earnings import get_next_earnings_date
+            from trading_skills.earnings import get_next_earnings_date, is_fund
 
             e = get_next_earnings_date(args.symbol.upper())
             if e:
                 days_to_earnings = (_dt.strptime(e, "%Y-%m-%d").date() - date.today()).days
+            else:
+                earnings_unknown = not is_fund(args.symbol.upper())
         except Exception:
-            days_to_earnings = None
+            earnings_unknown = True
 
         blockers, warnings = check_guardrails(
             symbol=args.symbol,
@@ -631,7 +746,17 @@ async def stage(args) -> int:
             hv30=hv30,
             iv_rank=iv_rank,
             is_roll=bool(args.roll_from),
+            open_put_collateral=open_put_collateral,
+            open_puts=len(short_puts),
+            itm_puts=itm_puts,
         )
+        if cash_warning:
+            warnings.append(cash_warning)
+        if earnings_unknown:
+            blockers.append(
+                "next earnings date could not be loaded for this stock; check it by hand and "
+                "stage only if it falls after expiry"
+            )
 
         if args.roll_from:
             return await _stage_roll(
@@ -712,6 +837,71 @@ async def stage(args) -> int:
             )
         )
         return 0
+
+
+async def _stage_close(ib, args, contract, account, bid, ask, generated_at_str) -> int:
+    """Stage a GTC buy-to-close of a short already held. Dry run unless --execute.
+
+    The only check that matters is the one the roll uses: the leg must be held SHORT,
+    otherwise this BUY would open a new long option instead of closing anything.
+    """
+    from ib_async import LimitOrder
+
+    held = None
+    try:
+        await asyncio.sleep(1)
+        held = 0.0
+        for pos in ib.positions(account) if account else ib.positions():
+            if pos.contract.conId == contract.conId:
+                held = float(pos.position)
+    except Exception:
+        held = None
+
+    blockers = check_close(held=held, qty=args.qty, limit=args.limit, ask=ask)
+    sym = args.symbol.upper()
+    header = "LIVE ORDER — CLOSE" if args.execute else "DRY RUN — CLOSE   (nothing transmitted)"
+    print("\n" + "=" * 68)
+    print(f"  {header}")
+    print("=" * 68)
+    leg = f"{sym} {args.expiry} {args.strike:g}{args.right}"
+    print(f"  BUY {args.qty} {leg} @ LMT {args.limit:.2f} GTC")
+    print(f"  market            {bid} / {ask}")
+    print(f"  cost to close     ${args.limit * 100 * args.qty:,.2f} (+ ~$1 commission)")
+    print("  In plain words: this buys back the option you sold. It rests until filled or")
+    print("  cancelled. Cancel it in TWS before rolling the same position.")
+    print("=" * 68)
+    print(f"  generated_at: {generated_at_str()}")
+    for b in blockers:
+        print(f"  BLOCKED: {b}")
+    if blockers:
+        print("\n  Refusing to stage. Fix the blockers above.\n")
+        return 1
+    if not args.execute:
+        print("\n  Dry run only. Re-run with --execute to transmit.\n")
+        return 0
+    order = LimitOrder("BUY", args.qty, args.limit, tif="GTC", orderRef="wheel-close")
+    if account:
+        order.account = account
+    trade = ib.placeOrder(contract, order)
+    await asyncio.sleep(2)
+    print(f"\n  TRANSMITTED. orderId={trade.order.orderId} status={trade.orderStatus.status}\n")
+    return 0
+
+
+def check_close(*, held: float | None, qty: int, limit: float, ask: float | None) -> list[str]:
+    """Blockers for a buy-to-close. Pure - tested in self_check."""
+    blockers = []
+    if held is None:
+        blockers.append("could not read positions; cannot confirm the leg is held short")
+    elif held > -qty:
+        blockers.append(
+            f"position is {held:+g}, need short {qty}. This BUY would OPEN a long option"
+        )
+    if limit <= 0:
+        blockers.append("limit must be a positive debit")
+    if ask is not None and ask > 0 and limit > ask:
+        blockers.append(f"limit {limit:.2f} is above the ask {ask:.2f}; that overpays")
+    return blockers
 
 
 async def _stage_roll(
@@ -876,7 +1066,7 @@ def self_check() -> int:
         delta=-0.25,
         dte=35,
         underlying_price=14.77,
-        excess_liquidity=12000.00,
+        excess_liquidity=20000.00,
         settled_cash=5000.00,
         shares_held=None,
         open_interest=800,
@@ -891,11 +1081,11 @@ def self_check() -> int:
     b, _ = check_guardrails(**{**base, "limit": 0.20})
     assert any("floor" in x for x in b), b
 
-    # Cash binds first here: 95% of $5,000 = $4,750 vs 60% of $12,000 = $7,200.
+    # Cash binds first here: 95% of $5,000 = $4,750 vs 30% of $20,000 = $6,000.
     b, _ = check_guardrails(**{**base, "strike": 50.0, "limit": 1.50})
     assert any("binding limit is settled cash" in x for x in b), b
 
-    # Excess liquidity binds when cash is plentiful: 60% of $12,000 = $7,200.
+    # Excess liquidity binds when cash is plentiful: 30% of $20,000 = $6,000.
     b, _ = check_guardrails(**{**base, "strike": 80.0, "limit": 2.50, "settled_cash": 50000.0})
     assert any("binding limit is excess liquidity" in x for x in b), b
 
@@ -984,7 +1174,7 @@ def self_check() -> int:
         delta=-0.25,
         dte=32,
         underlying_price=49.00,
-        excess_liquidity=12000.00,
+        excess_liquidity=20000.00,
         settled_cash=5000.00,
         shares_held=None,
         open_interest=900,
@@ -1004,13 +1194,84 @@ def self_check() -> int:
         delta=-0.28,
         dte=32,
         underlying_price=49.00,
-        excess_liquidity=12000.00,
+        excess_liquidity=20000.00,
         settled_cash=5000.00,
         shares_held=None,
         open_interest=900,
         days_to_earnings=None,
     )
     assert live46 == ([], []), live46
+
+    # --- book-level caps: the open puts count against the new one --------------------
+    # Total: 50% of $20,000 = $10,000. $9,000 open + $1,300 new breaches it.
+    b, _ = check_guardrails(**{**base, "open_put_collateral": 9000.0, "settled_cash": 50000.0})
+    assert any("total put collateral" in x for x in b), b
+    # Position count: the profile allows 2.
+    b, _ = check_guardrails(**{**base, "open_puts": 2, "open_put_collateral": 2000.0})
+    assert any("already open" in x for x in b), b
+    # An open put in the money blocks adding risk.
+    b, _ = check_guardrails(
+        **{**base, "open_puts": 1, "itm_puts": 1, "open_put_collateral": 2000.0}
+    )
+    assert any("in the money" in x for x in b), b
+    # Cash promised to open puts is not free: $5,000 cash - $4,000 open = $1,000 free.
+    b, _ = check_guardrails(**{**base, "open_puts": 1, "open_put_collateral": 4000.0})
+    assert any("NOT be cash-secured" in x for x in b), b
+    # A roll replaces a position, so the book-level checks do not apply to it.
+    b, _ = check_guardrails(
+        **{**base, "open_puts": 2, "itm_puts": 1, "open_put_collateral": 4000.0, "is_roll": True}
+    )
+    assert not any("already open" in x or "in the money" in x for x in b), b
+
+    # Margin-secured profile (never for beginners): $9,000 obligation, 50% in cash.
+    apply_profile(
+        {
+            **ex,
+            "sizing": {**ex["sizing"], "cash_secured_frac": 0.5},
+            "universe": {**ex["universe"], "overweight": ["BIGCO"]},
+        }
+    )
+    b, w = check_guardrails(
+        **{
+            **base,
+            "strike": 90.0,
+            "limit": 2.0,
+            "settled_cash": 5000.0,
+            "excess_liquidity": 50000.0,
+        }
+    )
+    assert not any("cash-secured" in x for x in b) and any("margin-secured" in x for x in w), (b, w)
+    b, _ = check_guardrails(
+        **{
+            **base,
+            "strike": 90.0,
+            "limit": 2.0,
+            "settled_cash": 4000.0,
+            "excess_liquidity": 50000.0,
+        }
+    )
+    assert any("NOT be cash-secured" in x for x in b), b
+    apply_profile({**ex, "universe": {**ex["universe"], "overweight": ["BIGCO"]}})
+
+    # --- buy-to-close -------------------------------------------------------------
+    assert check_close(held=-1.0, qty=1, limit=0.22, ask=0.25) == []
+    assert any("OPEN a long" in x for x in check_close(held=0.0, qty=1, limit=0.22, ask=0.25))
+    assert any("OPEN a long" in x for x in check_close(held=1.0, qty=1, limit=0.22, ask=0.25))
+    assert any("cannot confirm" in x for x in check_close(held=None, qty=1, limit=0.2, ask=0.25))
+    assert any("overpays" in x for x in check_close(held=-1.0, qty=1, limit=0.40, ask=0.25))
+
+    # --- premium label: thin means wait ----------------------------------------------
+    assert premium_label(iv=30.0, hv30=25.0, iv_rank=60.0) == "rich"
+    assert premium_label(iv=30.0, hv30=25.0, iv_rank=40.0) == "normal"
+    assert premium_label(iv=30.0, hv30=25.0, iv_rank=20.0) == "thin"
+    assert premium_label(iv=20.0, hv30=25.0, iv_rank=60.0) == "thin"  # below realised vol
+    assert premium_label(iv=30.0, hv30=25.0, iv_rank=None) == "thin"  # unknown = thin
+
+    # --- the plain-language block names the real consequence ------------------------
+    text = "\n".join(
+        plain_summary(symbol="abc", right="P", strike=13.0, expiry="20261218", limit=0.45, qty=1)
+    )
+    assert "buy 100 shares" in text and "$1,300" in text and "$45" in text, text
 
     # No market data at all.
     b, _ = check_guardrails(**{**base, "bid": None, "ask": None})
@@ -1105,6 +1366,12 @@ def main() -> int:
         help="roll mode: buy-to-close this existing short (same right) while selling the new "
         "leg, as one combo. --limit becomes the NET credit",
     )
+    p.add_argument(
+        "--close",
+        action="store_true",
+        help="buy-to-close an existing short (same symbol/right/strike/expiry) as a GTC limit "
+        "at --limit; use half the credit received for the 50%% take-profit",
+    )
     p.add_argument("--execute", action="store_true", help="transmit the order (default: dry run)")
     p.add_argument("--self-check", action="store_true", help="run guardrail assertions, no IB")
     args = p.parse_args()
@@ -1119,7 +1386,14 @@ def main() -> int:
     if args.execute and not PROFILE.exists():
         p.error("no profile.toml - run the wheel-onboard skill before trading for real")
 
-    return asyncio.run(stage(args))
+    try:
+        return asyncio.run(stage(args))
+    except ConnectionError as e:
+        print(
+            f"{e}\nStart TWS or IB Gateway, log in, and enable the API (README > Setup). "
+            "Then run this again."
+        )
+        return 2
 
 
 if __name__ == "__main__":

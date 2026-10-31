@@ -36,6 +36,20 @@ assignment, open short contracts, and net cost basis per share while shares are 
 carry unrealized P&L the table does not show — say so when reporting, and pull the mark
 from `ib-portfolio` if the user wants the full picture.
 
+## What happens at expiry (Friday)
+
+- **Put expires out of the money** (stock above the strike): nothing to do; it disappears
+  over the weekend. Log `expired`.
+- **Put finishes in the money:** it is assigned after the close. On Monday the shares are
+  in the account and strike × 100 has left your cash. Log `assigned`, then the agent
+  screens **covered calls** for that name, not new puts.
+- **Covered call finishes in the money:** your shares are sold at the strike. Log
+  `called_away`; you're back to cash and can sell a put again.
+- **Pin risk:** if the stock is within about 1% of your strike at 3:30 pm ET on expiry
+  day, close the option rather than leave it to chance. After-hours moves can still
+  assign you.
+- The GTC 50% close may already have closed the trade earlier. Log that fill as a `close`.
+
 ## Cash convention
 
 Money in positive, money out negative, commissions always subtract. `expired` moves no

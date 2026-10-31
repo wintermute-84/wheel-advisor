@@ -129,7 +129,7 @@ def screen(symbols: list[str], excess_liquidity: float, port: int, verbose: bool
     import asyncio
 
     from trading_skills.broker.options import get_expiries, get_option_chain
-    from trading_skills.earnings import get_next_earnings_date
+    from trading_skills.earnings import get_next_earnings_date, is_fund
     from trading_skills.utils import generated_at_str
 
     cap = excess_liquidity * MAX_POSITION_COLLATERAL_FRAC
@@ -146,6 +146,9 @@ def screen(symbols: list[str], excess_liquidity: float, port: int, verbose: bool
             continue
 
         exp_res = asyncio.run(get_expiries(symbol, port=port))
+        if "Could not connect" in str(exp_res.get("error", "")):
+            # Same failure for every symbol; say it once and stop.
+            return {"error": exp_res["error"]}
         if not exp_res.get("success"):
             skipped.append({"symbol": symbol, "reason": exp_res.get("error", "no expiries")})
             continue
@@ -158,6 +161,9 @@ def screen(symbols: list[str], excess_liquidity: float, port: int, verbose: bool
             continue
 
         earnings = get_next_earnings_date(symbol)
+        if not earnings and not is_fund(symbol):
+            skipped.append({"symbol": symbol, "reason": "earnings date unknown; check by hand"})
+            continue
         for expiry in expiries:
             dte = dte_of(expiry)
 
@@ -226,7 +232,8 @@ def screen(symbols: list[str], excess_liquidity: float, port: int, verbose: bool
                         }
                     )
 
-    results.sort(key=lambda c: c["annualized_pct"], reverse=True)
+    # Safest first: the largest cushion between spot and breakeven, then the most liquid.
+    results.sort(key=lambda c: (-c["downside_pct"], -(c["open_interest"] or 0)))
     return {
         "generated_at": generated_at_str(),
         "data_delay": "real-time",
@@ -315,6 +322,12 @@ def main() -> int:
     res = screen(
         args.symbols, args.excess_liquidity, args.port or default_ib_port(7497), args.verbose
     )
+    if "error" in res:
+        print(
+            f"{res['error']}\nStart TWS or IB Gateway, log in, and enable the API "
+            "(README > Setup). Then run this again."
+        )
+        return 2
     if args.json:
         print(json.dumps(res, indent=2))
     else:

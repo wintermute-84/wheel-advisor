@@ -59,9 +59,15 @@ cushion, and annualized yield. State the next earnings date. Then hand off to
 
 ## Guardrails applied
 
-From `profile.toml` (defaults in `profile.example.toml`): collateral ≤ 35% of excess
-liquidity · credit ≥ $35 · delta 0.20–0.30 · 21–45 DTE · OI ≥ 500 · bid/ask ≤ 10% of mid ·
-underlying ≥ $5 · no earnings inside the window.
+From `profile.toml` (defaults in `profile.example.toml`): collateral ≤ 30% of excess
+liquidity · credit ≥ $35 · delta 0.20–0.30 · 28–45 DTE · OI ≥ 500 and known · bid/ask ≤ 10%
+of mid · underlying ≥ $5 · no earnings inside the window · a stock whose earnings date
+can't be loaded is skipped (funds have none and pass).
+
+Results are ranked **safest first**: the largest cushion between today's price and the
+breakeven, then the most open interest. Annualized yield is shown but never the sort key.
+The screener does not know about open positions; `stage_order.py` checks the total cap,
+the position count and in-the-money puts when you stage.
 
 If nothing passes, **say so and report the reject reasons.** Do not loosen the filters
 to manufacture a trade.
