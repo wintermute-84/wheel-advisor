@@ -1,0 +1,227 @@
+# ABOUTME: Shared IB connection utilities used by all broker modules.
+# ABOUTME: Provides context manager, position fetching, normalization, and spot price helpers.
+
+import asyncio
+import os
+from contextlib import asynccontextmanager
+
+from dotenv import load_dotenv
+from ib_async import IB, Stock
+
+from trading_skills.broker.futures import detect_future_exchange, front_future
+from trading_skills.utils import fetch_with_timeout
+
+
+def default_ib_port(fallback: int | None) -> int | None:
+    """Resolve the default IB port from the IB_PORT env var, else the fallback.
+
+    Reads IB_PORT (from the shell or a .env file). Used as the argparse default
+    for --port across all ib-* skills so the port need not be passed on every
+    call. An explicit --port flag still wins because argparse only applies this
+    default when the flag is absent. A missing, blank, or non-integer IB_PORT
+    yields the fallback.
+    """
+    load_dotenv()
+    raw = os.environ.get("IB_PORT")
+    if raw is None:
+        return fallback
+    try:
+        return int(raw.strip())
+    except ValueError:
+        return fallback
+
+
+def default_flex_token(fallback: str | None = None) -> str | None:
+    """Resolve the FlexReport token from the IB_FLEX_TOKEN env var, else the fallback.
+
+    Reads IB_FLEX_TOKEN (from the shell or a .env file) so the token need not be
+    passed on every call. An explicit --flex-token flag still wins. A missing or
+    blank value yields the fallback.
+    """
+    load_dotenv()
+    raw = os.environ.get("IB_FLEX_TOKEN")
+    if raw is None or not raw.strip():
+        return fallback
+    return raw.strip()
+
+
+def default_flex_query_ids(fallback: list[str] | None = None) -> list[str] | None:
+    """Resolve FlexReport query ID(s) from the IB_FLEX_QUERY_ID env var.
+
+    Accepts a comma-separated list so multiple queries (e.g. one per year) can be
+    merged. An explicit --flex-query-id flag still wins. A missing or blank value
+    yields the fallback.
+    """
+    load_dotenv()
+    raw = os.environ.get("IB_FLEX_QUERY_ID")
+    if raw is None or not raw.strip():
+        return fallback
+    ids = [q.strip() for q in raw.split(",") if q.strip()]
+    return ids or fallback
+
+
+# Documented clientId allocation — one source of truth for all broker modules.
+CLIENT_IDS = {
+    "portfolio": 1,
+    "account": 2,
+    "collar": 3,
+    "portfolio_action": 11,
+    "pmcc_advisor": 12,
+    "delta_exposure": 10,
+    "options_expiries": 20,
+    "options_chain": 21,
+    "roll": 30,
+    "stop_loss": 14,
+    "trailing_stop": 15,
+    "trades": 40,
+    "zero_dte": 50,
+    "consolidate": 99,
+}
+
+
+@asynccontextmanager
+async def ib_connection(port: int, client_id: int, readonly: bool = True):
+    """Connect to IB, yield the IB instance, disconnect on exit.
+
+    readonly=True (default) tells ib_async not to issue the write-class startup
+    order-sync, which TWS otherwise flags as needing API write access (popup).
+    Order-placing skills pass readonly=False when actually executing.
+
+    Raises ConnectionError if the initial connection fails.
+    """
+    ib = IB()
+    try:
+        await ib.connectAsync(host="127.0.0.1", port=port, clientId=client_id, readonly=readonly)
+    except Exception as e:
+        raise ConnectionError(f"Could not connect to IB on port {port}: {e}") from e
+
+    try:
+        yield ib
+    finally:
+        ib.disconnect()
+
+
+async def fetch_positions(ib: IB, account: str | None = None, sleep: float = 2) -> list:
+    """Fetch raw IB Position objects, optionally filtered by account."""
+    await asyncio.sleep(sleep)
+    positions = ib.positions()
+    if account:
+        positions = [p for p in positions if p.account == account]
+    return positions
+
+
+def normalize_positions(raw_positions: list) -> list[dict]:
+    """Convert raw IB Position objects to plain dicts.
+
+    Divides avgCost by multiplier for OPT/FOP contracts.
+    """
+    result = []
+    for pos in raw_positions:
+        c = pos.contract
+        multiplier = int(c.multiplier) if c.multiplier else 100
+        entry = {
+            "account": pos.account,
+            "symbol": c.symbol,
+            "sec_type": c.secType,
+            "quantity": pos.position,
+            "avg_cost": pos.avgCost,
+            "strike": None,
+            "expiry": None,
+            "right": None,
+        }
+        if c.secType in ("OPT", "FOP"):
+            entry.update(
+                {
+                    "strike": c.strike,
+                    "expiry": c.lastTradeDateOrContractMonth,
+                    "right": c.right,
+                    "avg_cost": pos.avgCost / multiplier,
+                }
+            )
+        result.append(entry)
+    return result
+
+
+def best_option_chain(chains: list):
+    """Pick the chain with the most expirations, preferring SMART exchange.
+
+    IB may return multiple SMART entries with different sizes; we want the richest one.
+    """
+    smart_chains = [c for c in chains if c.exchange == "SMART"]
+    pool = smart_chains or chains
+    return max(pool, key=lambda c: len(c.expirations))
+
+
+async def fetch_spot_prices(ib: IB, symbols: list[str], timeout: float = 15.0) -> dict[str, float]:
+    """Fetch spot prices for stock symbols. Returns {symbol: price} dict.
+
+    Uses streaming market data (not snapshot) to avoid hanging outside trading hours
+    when IB's snapshot mode never completes for illiquid or after-hours markets.
+    """
+    if not symbols:
+        return {}
+
+    stock_contracts = [Stock(sym, "SMART", "USD") for sym in symbols]
+    qualified = await fetch_with_timeout(
+        ib.qualifyContractsAsync(*stock_contracts), timeout=timeout, default=[]
+    )
+    qualified = [qc for qc in qualified if qc is not None]
+    if not qualified:
+        return {}
+
+    tickers = [ib.reqMktData(qc, "", False, False) for qc in qualified]
+    await asyncio.sleep(3)
+    for qc in qualified:
+        ib.cancelMktData(qc)
+
+    prices = {}
+    for ticker in tickers:
+        if not ticker.contract:
+            continue
+        price = ticker.marketPrice()
+        if price and price > 0:
+            prices[ticker.contract.symbol] = price
+    return prices
+
+
+async def fetch_futures_spot_prices(
+    ib: IB, symbols: list[str], timeout: float = 15.0
+) -> dict[str, float]:
+    """Fetch spot prices for futures underlyings via IB continuous futures.
+
+    yfinance cannot price futures by bare symbol (e.g. "NQ"), so this uses IB
+    ContFuture contracts. Exchange is resolved dynamically from IB contract details.
+    Symbols whose exchange cannot be determined are silently skipped.
+    """
+    if not symbols:
+        return {}
+
+    pairs = await asyncio.gather(
+        *[_resolve_front_future(ib, sym) for sym in symbols], return_exceptions=True
+    )
+    contracts = [c for p in pairs if isinstance(p, tuple) and p[1] for _, c in [p]]
+    if not contracts:
+        return {}
+
+    tickers = [ib.reqMktData(c, "", False, False) for c in contracts]
+    await asyncio.sleep(3)
+    for c in contracts:
+        ib.cancelMktData(c)
+
+    prices = {}
+    for ticker in tickers:
+        if not ticker.contract:
+            continue
+        price = ticker.marketPrice()
+        if price and price > 0:
+            prices[ticker.contract.symbol] = price
+    return prices
+
+
+async def _resolve_front_future(ib: IB, symbol: str):
+    """Return (symbol, contract) for the front-month continuous future, or (symbol, None)."""
+    exchange = await detect_future_exchange(ib, symbol)
+    if not exchange:
+        return symbol, None
+    contract = await front_future(ib, symbol, exchange)
+    return symbol, contract
