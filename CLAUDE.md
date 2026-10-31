@@ -75,6 +75,11 @@ a definition, ever.
     clears the credit floor, write nothing and hold the shares.
   - After that, below-basis calls are allowed at 0.15–0.20Δ, and the risk block must say:
     *"This strike is below your basis of $X. If called away you lock in about $Y a share."*
+  - **Broken stock check.** Before a below-basis call, or when no call at or above basis
+    clears the credit floor, ask: *"Would you buy these shares today?"* If not, the
+    honest move is to sell them and put the cash into a new put on a name they would hold
+    for a year. Cost basis is history, not a reason to keep a stock. The user decides;
+    there's no automatic drawdown or time limit.
   - Don't hold a short call through an ex-dividend date when its remaining time value is
     smaller than the dividend: it will likely be assigned early.
 - **Thin premium means wait.** The risk block labels premium THIN, NORMAL or RICH

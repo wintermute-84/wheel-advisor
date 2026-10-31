@@ -20,6 +20,7 @@ of what you actually earned. **It never sends an order itself.**
 - [Day-to-day use](#day-to-day-use)
 - [A full cycle, step by step](#a-full-cycle-step-by-step)
 - [Safety rails](#safety-rails)
+- [When the wheel stalls](#when-the-wheel-stalls)
 - [Going live](#going-live)
 - [Troubleshooting](#troubleshooting)
 - [Glossary](#glossary)
@@ -193,6 +194,21 @@ Enforced by the code, not just by instructions:
   bid/ask spread under 10%; at least $35 of premium; no stocks under $5.
 - **Covered calls** need 100 whole shares.
 - **A bad `profile.toml` won't load,** rather than silently loosening a limit.
+
+## When the wheel stalls
+
+The wheel does best in flat or slowly rising markets. In a long decline you can be
+assigned on both positions and end up holding falling shares, with no cash left for new
+puts. That's the trade you accept, and you'll lag a rebound you're no longer positioned
+for. The brakes already in place:
+- two positions
+- no new put while one is in the money
+- when SPY is 10% under its 52-week high or VIX is above 30: at most one new put a week,
+  and no more than 40% of the account in puts
+
+Nothing here sells shares you still want. But if you wouldn't buy a stock today, holding
+it to "get back to even" isn't a strategy: sell it and use the cash on a name you'd
+happily own.
 
 ## Going live
 
